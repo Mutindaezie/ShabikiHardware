@@ -1,10 +1,9 @@
 import streamlit as st
 import sqlite3
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 DB_PATH = Path("shabiki.db")
-
 st.set_page_config(page_title="ShabikiHardware", page_icon="🛠️", layout="wide")
 
 
@@ -17,7 +16,7 @@ def init_db():
     con.executescript("""
     CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT UNIQUE,
+        name TEXT NOT NULL UNIQUE,
         unit TEXT,
         cost REAL,
         price REAL,
@@ -67,9 +66,7 @@ def init_db():
     );
     """)
     con.commit()
-
-    count = con.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-    if count == 0:
+    if con.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0:
         con.executemany("INSERT INTO items(name,unit,cost,price,reorder_level) VALUES(?,?,?,?,?)", [
             ("Cement 50kg", "bags", 640, 780, 40),
             ("Roofing sheet 3m", "pcs", 930, 1150, 30),
@@ -89,23 +86,28 @@ def init_db():
 init_db()
 
 
-def rows(sql, params=(), columns=None):
+def rows(sql, params=()):
     con = connect()
-    cur = con.execute(sql, params)
-    names = [d[0] for d in cur.description] if cur.description else (columns or [])
-    data = cur.fetchall()
+    data = con.execute(sql, params).fetchall()
     con.close()
-    return names, data
+    return data
 
 
 def stock_qty(item_id):
-    _, received = rows("SELECT COALESCE(SUM(qty),0) FROM stock_in WHERE item_id=?", (item_id,))
-    _, sold = rows("SELECT COALESCE(SUM(qty),0) FROM sales WHERE item_id=?", (item_id,))
-    return (received[0][0] or 0) - (sold[0][0] or 0)
+    received = rows("SELECT COALESCE(SUM(qty),0) FROM stock_in WHERE item_id=?", (item_id,))[0][0]
+    sold = rows("SELECT COALESCE(SUM(qty),0) FROM sales WHERE item_id=?", (item_id,))[0][0]
+    return (received or 0) - (sold or 0)
 
 
 def ksh(value):
     return f"KSh {value:,.0f}"
+
+
+def execute(sql, params=()):
+    con = connect()
+    con.execute(sql, params)
+    con.commit()
+    con.close()
 
 
 with st.sidebar:
@@ -114,28 +116,24 @@ with st.sidebar:
 
 if page == "Dashboard":
     st.title("Dashboard")
-    _, sales_today = rows("SELECT COALESCE(SUM(qty*price),0) FROM sales WHERE date=?", (date.today().isoformat(),))
-    _, month_sales = rows("SELECT COALESCE(SUM(qty*price),0) FROM sales WHERE substr(date,1,7)=?", (date.today().isoformat()[:7],))
-    _, expenses = rows("SELECT COALESCE(SUM(amount),0) FROM expenses")
-    _, income = rows("SELECT COALESCE(SUM(amount),0) FROM income")
-
+    sales_today = rows("SELECT COALESCE(SUM(qty*price),0) FROM sales WHERE date=?", (date.today().isoformat(),))[0][0]
+    month_sales = rows("SELECT COALESCE(SUM(qty*price),0) FROM sales WHERE substr(date,1,7)=?", (date.today().isoformat()[:7],))[0][0]
+    expenses = rows("SELECT COALESCE(SUM(amount),0) FROM expenses")[0][0]
+    income = rows("SELECT COALESCE(SUM(amount),0) FROM income")[0][0]
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sales today", ksh(sales_today[0][0]))
-    c2.metric("Sales this month", ksh(month_sales[0][0]))
-    c3.metric("Expenses", ksh(expenses[0][0]))
-    c4.metric("Other income", ksh(income[0][0]))
-
-    cols, data = rows("SELECT i.name,i.reorder_level,i.id FROM items i ORDER BY i.name")
+    c1.metric("Sales today", ksh(sales_today))
+    c2.metric("Sales this month", ksh(month_sales))
+    c3.metric("Expenses", ksh(expenses))
+    c4.metric("Other income", ksh(income))
+    data = rows("SELECT name,reorder_level,id FROM items ORDER BY name")
     st.subheader("Stock levels")
-    stock_data = [{"Item": name, "Quantity": stock_qty(item_id), "Reorder level": reorder} for name, reorder, item_id in data]
-    st.dataframe(stock_data, use_container_width=True, hide_index=True)
+    st.dataframe([{"Item": n, "Quantity": stock_qty(i), "Reorder level": level} for n, level, i in data], use_container_width=True, hide_index=True)
 
 elif page == "Inventory":
     st.title("Stock & Inventory")
-
     tab1, tab2 = st.tabs(["Stock items", "Receive stock"])
     with tab1:
-        with st.expander("Add stock item", expanded=False):
+        with st.expander("Add stock item"):
             with st.form("add_item"):
                 name = st.text_input("Item name")
                 unit = st.text_input("Unit", value="pcs")
@@ -144,34 +142,29 @@ elif page == "Inventory":
                 reorder = st.number_input("Reorder level", min_value=0, step=1)
                 if st.form_submit_button("Add item"):
                     if name:
-                        con = connect()
-                        con.execute("INSERT INTO items(name,unit,cost,price,reorder_level) VALUES(?,?,?,?,?)", (name, unit, cost, price, reorder))
-                        con.commit(); con.close()
-                        st.success("Item added")
-                        st.rerun()
-
-        cols, data = rows("SELECT id,name,unit,cost,price,reorder_level FROM items ORDER BY name")
-        stock_table = [{"ID": r[0], "Item": r[1], "Unit": r[2], "Buying price": ksh(r[3]), "Selling price": ksh(r[4]), "Available": stock_qty(r[0]), "Reorder level": r[5]} for r in data]
-        st.dataframe(stock_table, use_container_width=True, hide_index=True)
-
+                        try:
+                            execute("INSERT INTO items(name,unit,cost,price,reorder_level) VALUES(?,?,?,?,?)", (name, unit, cost, price, reorder))
+                            st.success("Item added")
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.error("An item with that name already exists.")
+        data = rows("SELECT id,name,unit,cost,price,reorder_level FROM items ORDER BY name")
+        st.dataframe([{"ID": r[0], "Item": r[1], "Unit": r[2], "Buying price": ksh(r[3]), "Selling price": ksh(r[4]), "Available": stock_qty(r[0]), "Reorder level": r[5]} for r in data], use_container_width=True, hide_index=True)
     with tab2:
-        _, suppliers = rows("SELECT id,name FROM suppliers")
-        _, items = rows("SELECT id,name,price,cost FROM items")
+        suppliers = rows("SELECT id,name FROM suppliers")
+        items = rows("SELECT id,name,cost FROM items")
         if suppliers and items:
             with st.form("receive_stock"):
                 received_date = st.date_input("Date", value=date.today())
                 supplier = st.selectbox("Supplier", suppliers, format_func=lambda x: x[1])
                 item = st.selectbox("Item", items, format_func=lambda x: x[1])
                 qty = st.number_input("Quantity", min_value=1.0, step=1.0)
-                unit_cost = st.number_input("Unit cost", min_value=0.0, value=float(item[3]), step=10.0)
+                unit_cost = st.number_input("Unit cost", min_value=0.0, value=float(item[2]), step=10.0)
                 if st.form_submit_button("Receive stock"):
-                    con = connect()
-                    con.execute("INSERT INTO stock_in(date,supplier_id,item_id,qty,cost) VALUES(?,?,?,?,?)", (received_date.isoformat(), supplier[0], item[0], qty, unit_cost))
-                    con.commit(); con.close()
+                    execute("INSERT INTO stock_in(date,supplier_id,item_id,qty,cost) VALUES(?,?,?,?,?)", (received_date.isoformat(), supplier[0], item[0], qty, unit_cost))
                     st.success("Stock received")
                     st.rerun()
-
-        cols, data = rows("SELECT si.date,s.name,i.name,si.qty,si.cost FROM stock_in si JOIN suppliers s ON s.id=si.supplier_id JOIN items i ON i.id=si.item_id ORDER BY si.id DESC")
+        data = rows("SELECT si.date,s.name,i.name,si.qty,si.cost FROM stock_in si JOIN suppliers s ON s.id=si.supplier_id JOIN items i ON i.id=si.item_id ORDER BY si.id DESC")
         st.dataframe([{"Date": r[0], "Supplier": r[1], "Item": r[2], "Quantity": r[3], "Unit cost": ksh(r[4])} for r in data], use_container_width=True, hide_index=True)
 
 elif page == "Suppliers":
@@ -182,19 +175,16 @@ elif page == "Suppliers":
             phone = st.text_input("Phone")
             if st.form_submit_button("Save supplier"):
                 if name:
-                    con = connect()
-                    con.execute("INSERT INTO suppliers(name,phone) VALUES(?,?)", (name, phone))
-                    con.commit(); con.close()
+                    execute("INSERT INTO suppliers(name,phone) VALUES(?,?)", (name, phone))
                     st.success("Supplier added")
                     st.rerun()
-
-    cols, data = rows("SELECT id,name,phone FROM suppliers ORDER BY name")
+    data = rows("SELECT id,name,phone FROM suppliers ORDER BY name")
     st.dataframe([{"ID": r[0], "Name": r[1], "Phone": r[2]} for r in data], use_container_width=True, hide_index=True)
 
 elif page == "Sales":
     st.title("Sales")
-    with st.expander("Record a sale", expanded=False):
-        _, items = rows("SELECT id,name,price FROM items")
+    with st.expander("Record a sale"):
+        items = rows("SELECT id,name,price FROM items")
         if items:
             with st.form("sale"):
                 sale_date = st.date_input("Date", value=date.today())
@@ -207,15 +197,12 @@ elif page == "Sales":
                 paid = st.number_input("Amount paid", min_value=0.0, step=100.0)
                 if st.form_submit_button("Save sale"):
                     if qty <= available:
-                        con = connect()
-                        con.execute("INSERT INTO sales(date,customer,item_id,qty,price,paid) VALUES(?,?,?,?,?,?)", (sale_date.isoformat(), customer, item[0], qty, price, paid))
-                        con.commit(); con.close()
+                        execute("INSERT INTO sales(date,customer,item_id,qty,price,paid) VALUES(?,?,?,?,?,?)", (sale_date.isoformat(), customer, item[0], qty, price, paid))
                         st.success("Sale recorded")
                         st.rerun()
                     else:
                         st.error("Not enough stock")
-
-    cols, data = rows("SELECT s.id,s.date,s.customer,i.name,s.qty,s.price,s.paid FROM sales s JOIN items i ON i.id=s.item_id ORDER BY s.id DESC")
+    data = rows("SELECT s.id,s.date,s.customer,i.name,s.qty,s.price,s.paid FROM sales s JOIN items i ON i.id=s.item_id ORDER BY s.id DESC")
     st.dataframe([{"Invoice": f"INV-{r[0]:04d}", "Date": r[1], "Customer": r[2], "Item": r[3], "Quantity": r[4], "Unit price": ksh(r[5]), "Total": ksh(r[4]*r[5]), "Paid": ksh(r[6]), "Balance": ksh(r[4]*r[5]-r[6])} for r in data], use_container_width=True, hide_index=True)
 
 elif page == "Accounts":
@@ -228,26 +215,21 @@ elif page == "Accounts":
             description = st.text_input("Description")
             amount = st.number_input("Amount", min_value=0.0, step=100.0)
             if st.form_submit_button("Record expense"):
-                con = connect()
-                con.execute("INSERT INTO expenses(date,category,description,amount) VALUES(?,?,?,?)", (expense_date.isoformat(), category, description, amount))
-                con.commit(); con.close()
+                execute("INSERT INTO expenses(date,category,description,amount) VALUES(?,?,?,?)", (expense_date.isoformat(), category, description, amount))
                 st.success("Expense recorded")
                 st.rerun()
-        cols, data = rows("SELECT date,category,description,amount FROM expenses ORDER BY id DESC")
+        data = rows("SELECT date,category,description,amount FROM expenses ORDER BY id DESC")
         st.dataframe([{"Date": r[0], "Category": r[1], "Description": r[2], "Amount": ksh(r[3])} for r in data], use_container_width=True, hide_index=True)
-
     with tab2:
         with st.form("income"):
             income_date = st.date_input("Income date", value=date.today())
             description = st.text_input("Source")
             amount = st.number_input("Amount", min_value=0.0, step=100.0, key="income_amount")
             if st.form_submit_button("Record income"):
-                con = connect()
-                con.execute("INSERT INTO income(date,description,amount) VALUES(?,?,?)", (income_date.isoformat(), description, amount))
-                con.commit(); con.close()
+                execute("INSERT INTO income(date,description,amount) VALUES(?,?,?)", (income_date.isoformat(), description, amount))
                 st.success("Income recorded")
                 st.rerun()
-        cols, data = rows("SELECT date,description,amount FROM income ORDER BY id DESC")
+        data = rows("SELECT date,description,amount FROM income ORDER BY id DESC")
         st.dataframe([{"Date": r[0], "Source": r[1], "Amount": ksh(r[2])} for r in data], use_container_width=True, hide_index=True)
 
 else:
@@ -260,11 +242,8 @@ else:
             salary = st.number_input("Monthly salary", min_value=0.0, step=1000.0)
             if st.form_submit_button("Add worker"):
                 if name:
-                    con = connect()
-                    con.execute("INSERT INTO workers(name,role,phone,salary) VALUES(?,?,?,?)", (name, role, phone, salary))
-                    con.commit(); con.close()
+                    execute("INSERT INTO workers(name,role,phone,salary) VALUES(?,?,?,?)", (name, role, phone, salary))
                     st.success("Worker added")
                     st.rerun()
-
-    cols, data = rows("SELECT id,name,role,phone,salary FROM workers ORDER BY name")
+    data = rows("SELECT id,name,role,phone,salary FROM workers ORDER BY name")
     st.dataframe([{"ID": r[0], "Name": r[1], "Role": r[2], "Phone": r[3], "Salary": ksh(r[4])} for r in data], use_container_width=True, hide_index=True)
